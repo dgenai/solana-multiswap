@@ -111,10 +111,20 @@ export const SwapIxsSchema = z
   })
   .passthrough(); // allow forward compatibility
 
+  export const SwapSchema = z
+  .object({
+    swapTransaction: z.string(), // base64 transaction string
+    lastValidBlockHeight: z.number(),
+    prioritizationFeeLamports: z.number().optional(),
+  })
+  .passthrough();
+
+
+
 // ---------------------------------------------------------------------------
 // Inferred Types
 // ---------------------------------------------------------------------------
-
+export type SwapResponse = z.infer<typeof SwapSchema>;
 export type SwapIxs = z.infer<typeof SwapIxsSchema>;
 export type SerializedIx = z.infer<typeof SerializedIxSchema>;
 export type AccountMeta = z.infer<typeof AccountMetaSchema>;

@@ -1,58 +1,81 @@
 // src/core/execute.ts
+import {
+  Connection,
+  VersionedTransaction,
+  Keypair,
+} from "@solana/web3.js";
+import bs58 from "bs58";
+
+const RPC = process.env.SOLANA_RPC ?? "https://api.mainnet-beta.solana.com";
+const conn = new Connection(RPC, "confirmed");
+
 /**
  * ----------------------------------------------------------------------------
- * execute
+ * Execute (on-chain submission)
  * ----------------------------------------------------------------------------
  *
- * Signs and submits a VersionedTransaction to the Solana blockchain.
+ * Utility to sign and submit a Solana v0 (VersionedTransaction).
  *
  * Features
- * - Loads a signer keypair from a base58-encoded secret key (string or env var)
- * - Signs the provided unsigned transaction
- * - Sends it with retry and preflight checks enabled
- * - Waits for confirmation at commitment level "confirmed"
+ * - Loads a signer from PRIVATE_KEY_B58 (expected base58-encoded secret key).
+ * - Refreshes `recentBlockhash` + `lastValidBlockHeight` to avoid expired TX errors.
+ * - Signs the transaction locally before sending.
+ * - Submits via `sendRawTransaction` with retries enabled.
+ * - Confirms the transaction using blockhash-based strategy (non-deprecated).
  *
- * Usage
- * ```ts
- * const sig = await execute(unsignedTx, mySecretKeyB58);
- * console.log("Transaction signature:", sig);
- * ```
- */
-
-import { VersionedTransaction, Keypair } from "@solana/web3.js";
-import bs58 from "bs58";
-import { getConnection } from "../lib/solana.js";
-
-/**
- * Execute a Solana transaction by signing it with a local keypair and broadcasting it.
+ * Typical failure modes handled:
+ * - `TransactionExpiredBlockheightExceededError` (blockhash expired)
+ * - Node drop / network transient errors (retries)
  *
- * @param unsignedTx - Unsigned VersionedTransaction (must include payer, blockhash, instructions)
- * @param base58Secret - Optional base58-encoded secret key. Falls back to `process.env.PRIVATE_KEY_B58`.
- * @returns The confirmed transaction signature string
- * @throws Error if no secret key is provided or if sending/confirmation fails
+ * @param unsignedTx A previously built but unsigned VersionedTransaction
+ * @returns The confirmed transaction signature (base58 string)
+ * @throws Error if signing key is missing or submission fails
  */
-export async function execute(unsignedTx: VersionedTransaction, base58Secret?: string) {
-  // Resolve secret key (explicit argument > env var)
-  const secretB58 = base58Secret ?? process.env.PRIVATE_KEY_B58;
-  if (!secretB58) throw new Error("Missing PRIVATE_KEY_B58");
+export async function execute(unsignedTx: VersionedTransaction): Promise<string> {
+  if (!process.env.PRIVATE_KEY_B58) {
+    throw new Error("Missing PRIVATE_KEY_B58");
+  }
 
-  // Decode base58 secret and reconstruct signer keypair
-  const keypair = Keypair.fromSecretKey(bs58.decode(secretB58));
+  // ---------------------------------------------------------------------------
+  // 1) Load signer keypair from environment
+  // ---------------------------------------------------------------------------
+  const secret = bs58.decode(process.env.PRIVATE_KEY_B58);
+  const signer = Keypair.fromSecretKey(secret);
 
-  // Sign the provided transaction
-  unsignedTx.sign([keypair]);
+  // ---------------------------------------------------------------------------
+  // 2) Refresh blockhash & lastValidBlockHeight for transaction validity
+  //    Ensures the transaction will not expire immediately on submission.
+  // ---------------------------------------------------------------------------
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
+  unsignedTx.message.recentBlockhash = blockhash;
 
-  // Get Solana RPC connection
-  const conn = getConnection();
+  // ---------------------------------------------------------------------------
+  // 3) Sign transaction (payer and signer must be included in unsignedTx)
+  // ---------------------------------------------------------------------------
+  unsignedTx.sign([signer]);
 
-  // Send raw transaction (with retries and preflight)
+  // ---------------------------------------------------------------------------
+  // 4) Submit transaction to cluster
+  //    - skipPreflight=false → run preflight checks (safer, more accurate CU/fees)
+  //    - maxRetries=3       → retry on transient errors
+  // ---------------------------------------------------------------------------
   const sig = await conn.sendRawTransaction(unsignedTx.serialize(), {
     skipPreflight: false,
     maxRetries: 3,
   });
 
-  // Wait for confirmation
-  await conn.confirmTransaction(sig, "confirmed");
+  // ---------------------------------------------------------------------------
+  // 5) Confirm transaction with blockhash strategy
+  //    Uses `blockhash + lastValidBlockHeight` to avoid deprecated API usage.
+  // ---------------------------------------------------------------------------
+  await conn.confirmTransaction(
+    {
+      signature: sig,
+      blockhash,
+      lastValidBlockHeight,
+    },
+    "confirmed"
+  );
 
   return sig;
 }
